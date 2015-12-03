@@ -46,6 +46,9 @@ class Mage_Shell_PatchClass extends Mage_Shell_Abstract
 	);
 	
 	protected $_fileWhitelist		= array();
+
+	protected $_formKeysIssue = false;
+	protected $_resetPasswordTokenIssue = false;
 	
 	/**
 	 * Apply PHP settings to shell script
@@ -88,42 +91,47 @@ class Mage_Shell_PatchClass extends Mage_Shell_Abstract
 			$this->_loadWhitelistsFromFile();
 			
 			$this->_findModules();
-			
-			static::log('---- Searching config for bad routers -----------------------------');
-			
-			$configAffectedModules	= $this->_fixBadAdminhtmlRouter( $dryRun );
-			
-			static::log('---- Moving controllers for bad routers to avoid conflicts --------');
-			$this->_moveAdminControllers( $configAffectedModules, $dryRun );
-			
-			static::log('---- Searching files for bad routes -------------------------------');
-			$this->_fixBadAdminRoutes( $dryRun );
-			
+			if (isset($this->_args['ignoreAdminRoutes'])) {
+				$this->_showUnescapedFields($dryRun);
+			}
+			else{
+				static::log('---- Searching config for bad routers -----------------------------');
+
+				$configAffectedModules	= $this->_fixBadAdminhtmlRouter( $dryRun );
+
+				static::log('---- Moving controllers for bad routers to avoid conflicts --------');
+				$this->_moveAdminControllers( $configAffectedModules, $dryRun );
+
+				static::log('---- Searching files for bad routes -------------------------------');
+				$this->_fixBadAdminRoutes( $dryRun );
+
+				sort( $this->_modifiedFiles );
+
+				static::log('---- Summary ------------------------------------------------------');
+				static::log( sprintf( "Affected Modules:\n  %s", implode( "\n  ", $configAffectedModules ) ) );
+				static::log( sprintf( "Affected Files:\n  %s", implode( "\n  ", $this->_modifiedFiles ) ) );
+				static::log( sprintf( "Issues:\n  %s", implode( "\n  ", static::$_errors ) ) );
+				static::log('See var/log/fixSUPEE6788.log for a record of all results.');
+
+				if( isset( $this->_args['recordAffected'] ) ) {
+					file_put_contents(
+						Mage::getBaseDir('var') . DS . 'log' . DS . 'fixSUPEE6788-modules.log',
+						implode( "\n", $configAffectedModules )
+					);
+					static::log('Wrote affected modules to var/log/fixSUPEE6788-modules.log');
+
+					file_put_contents(
+						Mage::getBaseDir('var') . DS . 'log' . DS . 'fixSUPEE6788-files.log',
+						implode( "\n", $this->_modifiedFiles )
+					);
+					static::log('Wrote affected files to var/log/fixSUPEE6788-files.log');
+				}
+			}
 			static::log('---- Searching for whitelist problems -----------------------------');
 			$whitelist = new TemplateVars();
 			$whitelist->execute( $dryRun );
-			
-			sort( $this->_modifiedFiles );
-			
-			static::log('---- Summary ------------------------------------------------------');
-			static::log( sprintf( "Affected Modules:\n  %s", implode( "\n  ", $configAffectedModules ) ) );
-			static::log( sprintf( "Affected Files:\n  %s", implode( "\n  ", $this->_modifiedFiles ) ) );
-			static::log( sprintf( "Issues:\n  %s", implode( "\n  ", static::$_errors ) ) );
-			static::log('See var/log/fixSUPEE6788.log for a record of all results.');
-			
-			if( isset( $this->_args['recordAffected'] ) ) {
-				file_put_contents(
-					Mage::getBaseDir('var') . DS . 'log' . DS . 'fixSUPEE6788-modules.log',
-					implode( "\n", $configAffectedModules )
-				);
-				static::log('Wrote affected modules to var/log/fixSUPEE6788-modules.log');
-				
-				file_put_contents(
-					Mage::getBaseDir('var') . DS . 'log' . DS . 'fixSUPEE6788-files.log',
-					implode( "\n", $this->_modifiedFiles )
-				);
-				static::log('Wrote affected files to var/log/fixSUPEE6788-files.log');
-			}
+			$this->_fixTemplateIssues();
+
 		}
 		elseif( !is_null( $this->_args['fixWhitelists'] ) ) {
 			static::log('-------------------------------------------------------------------');
@@ -154,6 +162,7 @@ Usage:  php -f fixSUPEE6788.php -- [options] [recordAffected]
   fixWhitelists     Add any missing whitelist entries, without any other changes. SUPEE-6788 must be applied first.
   
   recordAffected    If given, affected modules/files will be written to var/log/fixSUPEE6788-modules.log and var/log/fixSUPEE6788-files.log for other uses.
+  ignoreAdminRoutes    do not analyze or fix admin route issue APPSEC-1034
   
   For all cases, shell/fixSUPEE6788-whitelist-modules.log and shell/fixSUPEE6788-whitelist-files.log will be loaded and excluded from analysis/changes if they exist. Format same as recordAffected output.
 
@@ -403,20 +412,17 @@ XML;
 		
 		return $this;
 	}
-	
-	/**
-	 * Attempt to find and fix any admin URLs (routes) affected by the router change.
-	 *
-	 * @param boolean $dryRun If true, find affected only; do not apply changes.
-	 * @return $this
-	 */
-	protected function _fixBadAdminRoutes( $dryRun=true )
+
+	public function loopLines($dryRun, $lineCallBack, $scanPaths = array())
 	{
-		$scanPaths = array(
-			Mage::getBaseDir('code'),
-			Mage::getBaseDir('design') . DS . 'adminhtml',
-		);
-		
+		if (!$scanPaths){
+			$scanPaths = array(
+				Mage::getBaseDir('code'),
+				Mage::getBaseDir('design') . DS . 'adminhtml',
+			);
+		}
+
+
 		/**
 		 * Trudge through the filesystem.
 		 */
@@ -430,94 +436,236 @@ XML;
 				if( strrpos( $file, '.php' ) === false && strrpos( $file, '.xml' ) === false && strrpos( $file, '.phtml' ) === false ) {
 					continue;
 				}
-				
+
 				// Skip any files inside .svn directories
 				if( strrpos( $file, '.svn') !== false) {
 					continue;
 				}
-				
+
 				// Skip any whitelisted files.
 				if( in_array( $file, $this->_fileWhitelist ) ) {
 					continue;
 				}
-				
+
 				$fileContents	= file_get_contents( $file );
 				$lines			= explode( "\n", $fileContents );
-				$changes		= false;
-				
-				/**
-				 * Scan the file line-by-line for each pattern.
-				 */
-				$oldUrlPath = '';
-				$newUrlPath = '';
-				$checkLine  = -1;
-				foreach( $lines as $key => $line ) {
-					foreach( $this->_fileReplacePatterns as $pattern => $replacement ) {
-						if( strpos( $line, $pattern ) !== false ) {
-							$lines[ $key ] = str_replace( $pattern, $replacement, $line );
-						} else if ( $checkLine !== $key && strpos( $pattern, 'getUrl' ) !== false && strpos( $line, 'getUrl' ) !== false ) {
-							// Handle multi-line getUrl syntax. cf. https://github.com/rhoerr/supee-6788-toolbox/pull/1
-							$oldUrlPath = substr( $pattern, strcspn($pattern, '"\'') + 1 );
-							$newUrlPath = substr( $replacement, strcspn($replacement, '"\'') + 1 );
-							$checkLine  = ( strlen($oldUrlPath) > 0 && strlen($newUrlPath ) > 0 ) ? $key + 1 : -1;
-						}
-
-						if ( $key == $checkLine ) {
-							if( strpos( $line, $oldUrlPath ) !== false ) {
-								$lines[ $key ] = str_replace( $oldUrlPath, $newUrlPath, $line );
-							}
-							
-							$oldUrlPath     = '';
-							$newUrlPath     = '';
-							$checkLine      = -1;
-						}
-					}
-					
-					/**
-					 * Check for APPSEC-1063 - Thanks @timvroom
-					 */
-					if( preg_match( '/addFieldToFilter\(\s*[\'"]?[\`\(]/i', $line ) ) {
-						static::log( sprintf( 'POSSIBLE SQL VULNERABILITY: %s:%s', $file, $key ), true );
-						static::log( sprintf( '  CODE:%s', $line ) );
-					}
-					
-					/**
-					 * If this line has any changes, record it.
-					 */
-					if( $line != $lines[ $key ] ) {
-						if( $changes === false ) {
-							static::log( $file );
-							$changes = true;
-						}
-						
-						static::log( sprintf( '  WAS:%s', $line ) );
-						static::log( sprintf( '  NOW:%s', $lines[ $key ] ) );
-					}
+				if (!is_array($lineCallBack) || is_callable($lineCallBack)) {
+					$lineCallBack = array($lineCallBack);
 				}
-				
-				/**
-				 * If the file has been modified, record it and save.
-				 */
-				if( $changes === true ) {
-					if( $dryRun === false ) {
-						$fileContents = implode( "\n", $lines );
-						
-						if( file_put_contents( $file, $fileContents ) !== false ) {
-							$this->_modifiedFiles[] = $file;
-							// Silence!
-						}
-						else {
-							static::log( sprintf( 'Unable to write changes to %s', $file ), true );
-						}
-					}
-					else {
-						$this->_modifiedFiles[] = $file;
+				foreach ($lineCallBack as $callBack) {
+					if (is_callable($callBack)) {
+						$args = array($dryRun, $lines, $fileContents, $file);
+						call_user_func_array($callBack, $args);
 					}
 				}
 			}
 		}
-		
+	}
+
+	/**
+	 * call back to display already escaped calls to addFieldToFilter
+	 * @param $dryRun
+	 * @param $lines
+	 * @param $file
+	 */
+	public function displayEscapedFieldsCallBack($dryRun, $lines, $fileContents, $file)
+	{
+		foreach ($lines as $key => $line) {
+			/**
+			 * Check for APPSEC-1063 - Thanks @timvroom
+			 */
+			if( preg_match( '/addFieldToFilter\(\s*[\'"]?[\`\(]/i', $line ) ) {
+				static::log( sprintf( 'POSSIBLE SQL VULNERABILITY: %s:%s', $this->removeBaseDir($file), $key+1 ), true );
+				static::log( sprintf( '  CODE:%s', $line ) );
+			}
+		}
+	}
+
+	/**
+	 * display code where form keys are missing
+	 *
+	 * @param $dryRun
+	 * @param $lines
+	 * @param $file
+	 */
+	public function formKeysCallBack($dryRun, $lines, $fileContents, $file)
+	{
+		if (!strpos($file, 'register.phtml')) {
+			return ;
+		}
+		if (strpos($fileContents,'getSuccessUrl') && !(strpos($fileContents,'getFormKey'))){
+			static::log( sprintf( 'POSSIBLE MISSING FORMKEYS: %s', $this->removeBaseDir($file)), true );
+			$this->_formKeysIssue = true;
+		}
+	}
+
+	/**
+	 * display code which is still using setResetPasswordLinkToken or getResetPasswordLinkToken
+	 *
+	 * @param $dryRun
+	 * @param $lines
+	 * @param $file
+	 */
+	public function passwordTokenCallBack($dryRun, $lines, $fileContents, $file)
+	{
+		if (strpos($fileContents,'setResetPasswordLinkToken') || (strpos($fileContents,'getResetPasswordLinkToken'))){
+			foreach ($lines as $key => $line) {
+				if (strpos($line,'setResetPasswordLinkToken') || (strpos($line,'getResetPasswordLinkToken'))){
+					static::log( sprintf( 'POSSIBLE use of resetPasswordLinkToken: %s:%s', $this->removeBaseDir($file), $key+1 ), true );
+					static::log( sprintf( '  CODE:%s', $line ) );
+				}
+			}
+			$this->_resetPasswordTokenIssue = true;
+		}
+	}
+
+	public function removeBaseDir($file)
+	{
+		return str_replace(Mage::getBaseDir('base') . '/','',$file);
+	}
+
+	protected function _fixTemplateIssues( $dryRun=true )
+	{
+		static::log('---- Searching for template issues  -----------------------------');
+		$formsKeysCallBack = (array($this, 'formKeysCallBack'));
+		$passwordTokenCallBack = (array($this, 'passwordTokenCallBack'));
+		$callBack = array($formsKeysCallBack, $passwordTokenCallBack);
+
+		$scanPaths = array(Mage::getBaseDir('design'), Mage::getBaseDir('code'));
+		$scanPaths = $this->addVendorFolderToArray($scanPaths);
+		$this->loopLines($dryRun, $callBack, $scanPaths);
+		if ($this->_formKeysIssue){
+			$message = "Fix Form Keys issue by adding \n"
+					. '  <input type="hidden" name="form_key" value="<?php echo Mage::getSingleton("core/session")->getFormKey() ?>" />';
+			static::log($message);
+		}
+		if ($this->_resetPasswordTokenIssue){
+			$message = "fix Reset password token issue by removing \n"
+				. " , array('_query' => array('id' => \$this->getCustomerId(), 'token' => \$this->getResetPasswordLinkToken()))";
+			static::log($message);
+		}
 		return $this;
+	}
+
+	/**
+	 * Call back to fix Admin Routes
+	 * @param $dryRun
+	 * @param $lines
+	 * @param $file
+	 */
+	public function fixAdminRouteCallBack($dryRun, $lines, $fileContents, $file)
+	{
+		$changes = false;
+
+		/**
+		 * Scan the file line-by-line for each pattern.
+		 */
+		$oldUrlPath = '';
+		$newUrlPath = '';
+		$checkLine = -1;
+		foreach ($lines as $key => $line) {
+			foreach ($this->_fileReplacePatterns as $pattern => $replacement) {
+				if (strpos($line, $pattern) !== false) {
+					$lines[$key] = str_replace($pattern, $replacement, $line);
+				}
+				else if ($checkLine !== $key && strpos($pattern, 'getUrl') !== false && strpos($line, 'getUrl') !== false) {
+					// Handle multi-line getUrl syntax. cf. https://github.com/rhoerr/supee-6788-toolbox/pull/1
+					$oldUrlPath = substr($pattern, strcspn($pattern, '"\'') + 1);
+					$newUrlPath = substr($replacement, strcspn($replacement, '"\'') + 1);
+					$checkLine = (strlen($oldUrlPath) > 0 && strlen($newUrlPath) > 0) ? $key + 1 : -1;
+				}
+
+				if ($key == $checkLine) {
+					if (strpos($line, $oldUrlPath) !== false) {
+						$lines[$key] = str_replace($oldUrlPath, $newUrlPath, $line);
+					}
+
+					$oldUrlPath = '';
+					$newUrlPath = '';
+					$checkLine = -1;
+				}
+			}
+
+			/**
+			 * If this line has any changes, record it.
+			 */
+			if ($line != $lines[$key]) {
+				if ($changes === false) {
+					static::log($file);
+					$changes = true;
+				}
+
+				static::log(sprintf('  WAS:%s', $line));
+				static::log(sprintf('  NOW:%s', $lines[$key]));
+			}
+		}
+
+		/**
+		 * If the file has been modified, record it and save.
+		 */
+		if ($changes === true) {
+			if ($dryRun === false) {
+				$fileContents = implode("\n", $lines);
+
+				if (file_put_contents($file, $fileContents) !== false) {
+					$this->_modifiedFiles[] = $file;
+					// Silence!
+				}
+				else {
+					static::log(sprintf('Unable to write changes to %s', $file), true);
+				}
+			}
+			else {
+				$this->_modifiedFiles[] = $file;
+			}
+		}
+	}
+	/**
+	 * Attempt to find and fix any admin URLs (routes) affected by the router change.
+	 *
+	 * @param boolean $dryRun If true, find affected only; do not apply changes.
+	 * @return $this
+	 */
+	protected function _fixBadAdminRoutes( $dryRun=true )
+	{
+		$adminRouteCallBack = (array($this,'fixAdminRouteCallBack'));
+		$escapedFieldsCallBack = (array($this,'displayEscapedFieldsCallBack'));
+
+		$callBack = array($adminRouteCallBack, $escapedFieldsCallBack);
+		$this->loopLines($dryRun,$callBack);
+		return $this;
+	}
+
+	/**
+	 * Display already escaped calls to addFieldToFilter
+	 * @param $dryRun
+	 */
+	protected function _showUnescapedFields($dryRun)
+	{
+		$escapedFieldsCallBack = (array($this,'displayEscapedFieldsCallBack'));
+		$scanPaths = array(Mage::getBaseDir('design'), Mage::getBaseDir('code'),);
+		$scanPaths = $this->addVendorFolderToArray($scanPaths);
+		$this->loopLines($dryRun,$escapedFieldsCallBack,$scanPaths);
+	}
+
+	protected function getVendorFolder($vendorFolder)
+	{
+		$vendorFolder = dirname(dirname(Mage::getBaseDir('code'))) . '/' . $vendorFolder;
+		$vendorFolder = is_dir($vendorFolder) ? $vendorFolder : false;
+		return $vendorFolder;
+	}
+
+	protected function addVendorFolderToArray($arrayGiven)
+	{
+		$vendorFolder = $this->getVendorFolder('vendor');
+		if ($vendorFolder) {
+			$arrayGiven[] = $vendorFolder;
+		}
+		$vendorFolder = $this->getVendorFolder('.modman');
+		if ($vendorFolder) {
+			$arrayGiven[] = $vendorFolder;
+		}
+		return $arrayGiven;
 	}
 	
 	/**
@@ -535,6 +683,12 @@ XML;
 			
 			// Skip any whitelisted modules.
 			if( !in_array( $name, $this->_moduleWhitelist ) && !in_array( $dir, $this->_moduleWhitelist ) ) {
+				if (isset($this->_modules[ $name ])){
+					continue;
+				}
+				if (is_dir(realpath($dir)) && ((is_link($dir)) || ($dir != realpath($dir))) ){
+					$dir = realpath($dir);
+				}
 				$this->_modules[ $name ] = $dir;
 			}
 		}
@@ -693,6 +847,7 @@ class TemplateVars
 		$this->walkDir($scan, $localeDir, $list);
 		
 		if(count($list['block']) > 0) {
+			$setupScriptVariables = array();
 			Mage_Shell_PatchClass::log('Blocks that are not whitelisted:');
 			
 			$inserts	= array();
@@ -704,6 +859,7 @@ class TemplateVars
 					'block_name' => $blockName,
 					'is_allowed' => 1,
 				);
+				$setupScriptVariables[$blockName] = $blockName;
 			}
 			
 			if( $dryRun === false && !is_null( $this->_blocksTable ) && count( $inserts ) > 0 ) {
@@ -711,13 +867,34 @@ class TemplateVars
 				
 				Mage_Shell_PatchClass::log('Added missing entries to the whitelist');
 			}
+			//blocks detected during dry run
+			elseif ($setupScriptVariables){
+				$variableString = var_export(array_values($setupScriptVariables) ,true);
+				//strip numeric keys 1=> 'value
+				$variableString = preg_replace("/[0-9]+ \=\>/i", '', $variableString);
+				$content = '$blocksToAllow = ' . $variableString . ";\n\n";
+				$content.= <<<scriptContent
+foreach (\$blocksToAllow as \$blockName) {
+	//collection load avoids duplicate creation if setup script is executed multiple times
+	Mage::getModel('admin/block')
+    ->getCollection()
+    ->addFieldToFilter('block_name',\$blockName)
+    ->getFirstItem()
+    ->setBlockName(\$blockName)
+    ->setIsAllowed(true)
+    ->save();
+}
+scriptContent;
+				Mage_Shell_PatchClass::log("Add following as setup script \n\n" . $content . "\n");
+
+			}
 		}
 		
 		if(count($list['variable']) > 0) {
 			Mage_Shell_PatchClass::log('Config variables that are not whitelisted:');
 			
 			$inserts	= array();
-			
+			$setupScriptVariables = array();
 			foreach ($list['variable'] as $key => $varName) {
 				Mage_Shell_PatchClass::log( sprintf( '  %s in %s', $varName, substr( $key, 0, -1 * strlen($varName) ) ) );
 				
@@ -725,12 +902,34 @@ class TemplateVars
 					'variable_name' => $varName,
 					'is_allowed'    => 1,
 				);
+				$setupScriptVariables[$varName] = $varName;
 			}
 			
 			if( $dryRun === false && !is_null( $this->_varsTable ) && count( $inserts ) > 0 ) {
 				$this->_write->insertMultiple( $this->_varsTable, array_values( $inserts ) );
 				
 				Mage_Shell_PatchClass::log('Added missing entries to the whitelist');
+			}
+			elseif ($setupScriptVariables){
+				$variableString = var_export(array_values($setupScriptVariables) ,true);
+				//strip numeric keys 1=> 'value
+				$variableString = preg_replace("/[0-9]+ \=\>/i", '', $variableString);
+				$content = '$variablesToAllow = ' . $variableString . ";\n\n";
+				Mage::getModel('admin/variable')->load();
+				$content.= <<<scriptContent
+foreach (\$variablesToAllow as \$variableName) {
+	//collection load avoids duplicate creation if setup script is executed multiple times
+	Mage::getModel('admin/variable')
+    ->getCollection()
+    ->addFieldToFilter('variable_name',\$variableName)
+    ->getFirstItem()
+    ->setBlockName(\$variableName)
+    ->setIsAllowed(true)
+    ->save();
+}
+scriptContent;
+				Mage_Shell_PatchClass::log("Add following as setup script \n\n" . $content . "\n");
+
 			}
 		}
 	}
